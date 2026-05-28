@@ -6,6 +6,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import statsmodels.api as sm
+from scipy.integrate import odeint
 
 BASE_DIR = Path(__file__).resolve().parent
 RISK_PATH = BASE_DIR / "outputs" / "new_poor_risk.csv"
@@ -656,6 +658,121 @@ def build_pasay_section(baseline_frame: pd.DataFrame, projection_frame: pd.DataF
         st.info("No barangay totals were available to display.")
 
 
+def fit_poverty_threshold_regression(frame: pd.DataFrame, predictors: list[str], forecast_years: int = 5):
+    if frame.empty or "poverty_threshold_per_capita" not in frame.columns:
+        return None
+    df = frame.loc[frame["year"].notna()].copy()
+    if df.empty:
+        return None
+    y = df["poverty_threshold_per_capita"].astype(float)
+    X = pd.DataFrame({"year": df["year"].astype(float)})
+    for p in (predictors or []):
+        if p in df.columns:
+            X[p] = df[p].astype(float)
+    X = sm.add_constant(X, has_constant="add")
+    try:
+        model = sm.OLS(y, X, missing="drop").fit()
+    except Exception:
+        return None
+
+    # Forecast using last known values (mean for other predictors) for next years
+    last_year = int(df["year"].max())
+    future_years = list(range(last_year + 1, last_year + 1 + forecast_years))
+    future = pd.DataFrame({"year": future_years})
+    for p in (predictors or []):
+        if p in df.columns:
+            future[p] = df[p].mean()
+    future = sm.add_constant(future, has_constant="add")
+    try:
+        preds = model.predict(future)
+    except Exception:
+        preds = pd.Series([pd.NA] * len(future), index=future.index)
+
+    fitted = pd.Series(model.fittedvalues, index=df.index)
+    forecast = pd.DataFrame({"year": future_years, "poverty_threshold_per_capita": preds})
+    return {"model": model, "fitted": fitted, "observed_df": df, "forecast_df": forecast}
+
+
+def simulate_compartment(beta: float, delta: float, gamma: float, M0: float, P0: float, R0: float, t: list[float]):
+    def deriv(y, t0, beta, delta, gamma):
+        M, P, R = y
+        dM = -beta * M * P + gamma * R
+        dP = beta * M * P - delta * P
+        dR = delta * P - gamma * R
+        return [dM, dP, dR]
+
+    y0 = [M0, P0, R0]
+    sol = odeint(deriv, y0, t, args=(beta, delta, gamma))
+    df = pd.DataFrame(sol, columns=["M", "P", "R"]) 
+    df["t"] = t
+    return df
+
+
+def build_modeling_section(baseline_frame: pd.DataFrame, projection_frame: pd.DataFrame) -> None:
+    st.divider()
+    st.header("Modeling: Regression and Compartmental Simulation")
+
+    tab1, tab2 = st.tabs(["Poverty-threshold regression", "Compartmental simulation"])
+
+    with tab1:
+        st.markdown("Fit a simple OLS model for `poverty_threshold_per_capita` using `year` and optional predictors.")
+        dataset_choice = st.selectbox("Dataset to use", ["Projection", "Baseline"], index=0)
+        df = projection_frame if dataset_choice == "Projection" else baseline_frame
+        numeric_cols = [c for c in df.select_dtypes(include="number").columns if c != "poverty_threshold_per_capita"]
+        predictors = st.multiselect("Additional predictors (optional)", numeric_cols, max_selections=2)
+        forecast_years = st.slider("Forecast years", 1, 10, 5)
+        if st.button("Fit regression"):
+            res = fit_poverty_threshold_regression(df, predictors, forecast_years)
+            if not res:
+                st.error("Could not fit model — check that `poverty_threshold_per_capita` and `year` exist and have values.")
+            else:
+                model = res["model"]
+                st.subheader("Model summary")
+                st.text(model.summary().as_text())
+                obs = res["observed_df"]
+                fitted = res["fitted"]
+                fc = res["forecast_df"]
+                fig = build_dark_figure("Poverty threshold: observed, fitted, forecast", height=420)
+                fig.add_trace(go.Scatter(x=obs["year"], y=obs["poverty_threshold_per_capita"], mode="markers+lines", name="Observed"))
+                fig.add_trace(go.Scatter(x=obs["year"], y=fitted, mode="lines", name="Fitted"))
+                fig.add_trace(go.Scatter(x=fc["year"], y=fc["poverty_threshold_per_capita"], mode="lines+markers", name="Forecast"))
+                fig.update_xaxes(title_text="Year")
+                fig.update_yaxes(title_text="PHP")
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        st.markdown("Simulate a compartmental model for vulnerable (`M`), newly poor (`P`), and recovering (`R`) households.")
+        cols = st.columns(3)
+        with cols[0]:
+            beta = st.number_input("Beta (transition rate)", value=1e-6, format="%.6f")
+            delta = st.number_input("Delta (to recovery rate)", value=0.1)
+            gamma = st.number_input("Gamma (reversion rate)", value=0.05)
+        with cols[1]:
+            M0 = st.number_input("Initial M (vulnerable)", value=70000.0)
+            P0 = st.number_input("Initial P (newly poor)", value=10000.0)
+            R0 = st.number_input("Initial R (recovered)", value=5000.0)
+        with cols[2]:
+            years = st.slider("Simulation years", 1, 50, 10)
+            steps_per_year = st.selectbox("Steps per year", [1, 4, 12], index=0)
+
+        t = list([i / steps_per_year for i in range(0, years * steps_per_year + 1)])
+        stress = st.radio("Stress scenarios", ["Baseline", "Moderate stress", "High stress"], index=0)
+        stress_multiplier = {"Baseline": 1.0, "Moderate stress": 1.3, "High stress": 1.7}[stress]
+
+        if st.button("Run simulation"):
+            bm = beta * stress_multiplier
+            df = simulate_compartment(bm, delta, gamma, M0, P0, R0, t)
+            fig = build_dark_figure("Compartmental simulation", height=420)
+            fig.add_trace(go.Scatter(x=df["t"], y=df["M"], mode="lines", name="Vulnerable (M)"))
+            fig.add_trace(go.Scatter(x=df["t"], y=df["P"], mode="lines", name="Newly poor (P)"))
+            fig.add_trace(go.Scatter(x=df["t"], y=df["R"], mode="lines", name="Recovered (R)"))
+            fig.update_xaxes(title_text="Years")
+            fig.update_yaxes(title_text="Households")
+            st.plotly_chart(fig, use_container_width=True)
+
+
+
+
 def main():
     st.set_page_config(page_title="Poverty Modeling Dashboard", layout="wide")
     st.title("Poverty Modeling Dashboard")
@@ -726,6 +843,7 @@ def main():
             st.plotly_chart(projection_only_figure, use_container_width=True)
 
     build_pasay_section(baseline_frame, projection_frame)
+    build_modeling_section(baseline_frame, projection_frame)
 
 
 if __name__ == "__main__":
