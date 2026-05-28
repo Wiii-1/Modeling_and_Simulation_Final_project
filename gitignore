@@ -1,0 +1,9 @@
+*.log
+.log
+output/
+.vscode/
+env/
+.venv-1/
+__pycache__/
+.venv/
+outputs/
