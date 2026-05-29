@@ -727,30 +727,56 @@ def build_modeling_section(baseline_frame: pd.DataFrame, projection_frame: pd.Da
                 st.error("Could not fit model — check that `poverty_threshold_per_capita` and `year` exist and have values.")
             else:
                 model = res["model"]
-                st.subheader("Model summary")
-                st.text(model.summary().as_text())
                 obs = res["observed_df"]
                 fitted = res["fitted"]
                 fc = res["forecast_df"]
+
+                # Explain forecasting behavior and show predictor means
+                st.info("Note: future predictor values are set to their historical mean for forecasting. The forecast is conditional on those constant predictor values.")
+                if predictors:
+                    mean_table = {p: float(obs[p].mean()) for p in predictors if p in obs.columns}
+                    if mean_table:
+                        st.write("Future predictor values used for forecasting (historical mean):")
+                        st.table(pd.DataFrame.from_dict(mean_table, orient='index', columns=['mean']).rename_axis('predictor'))
+
+                # Option to show coefficients and CIs
+                if st.checkbox("Show model coefficients (with 95% CI)"):
+                    params = model.params.copy()
+                    ci = model.conf_int(alpha=0.05)
+                    coeffs = pd.DataFrame({'coef': params}).join(ci)
+                    coeffs.columns = ['coef', 'ci_lower', 'ci_upper']
+                    st.table(coeffs)
+
+                # Build plot and annotate forecast start
                 fig = build_dark_figure("Poverty threshold: observed, fitted, forecast", height=420)
-                fig.add_trace(go.Scatter(x=obs["year"], y=obs["poverty_threshold_per_capita"], mode="markers+lines", name="Observed"))
-                fig.add_trace(go.Scatter(x=obs["year"], y=fitted, mode="lines", name="Fitted"))
-                fig.add_trace(go.Scatter(x=fc["year"], y=fc["poverty_threshold_per_capita"], mode="lines+markers", name="Forecast"))
+                fig.add_trace(go.Scatter(x=obs["year"], y=obs["poverty_threshold_per_capita"], mode="markers+lines", name="Observed", marker=dict(color="#1f77b4")))
+                fig.add_trace(go.Scatter(x=obs["year"], y=fitted, mode="lines", name="Fitted", line=dict(color="#ff7f0e")))
+                fig.add_trace(go.Scatter(x=fc["year"], y=fc["poverty_threshold_per_capita"], mode="lines+markers", name="Forecast", line=dict(color="#2ca02c")))
+
+                # vertical line at forecast start
+                try:
+                    last_year = int(obs["year"].max())
+                    y_max = max(float(obs["poverty_threshold_per_capita"].max()), float(fc["poverty_threshold_per_capita"].max()))
+                    fig.add_vline(x=last_year, line_dash="dash", line_color="gray", opacity=0.6)
+                    fig.add_annotation(x=last_year + 0.2, y=y_max, text="Forecast start", showarrow=False, font=dict(color="white", size=10))
+                except Exception:
+                    pass
+
                 fig.update_xaxes(title_text="Year")
                 fig.update_yaxes(title_text="PHP")
                 st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
-        st.markdown("Simulate a compartmental model for vulnerable (`M`), newly poor (`P`), and recovering (`R`) households.")
+        st.markdown("Simulate a compartmental model for vulnerable (`M`), newly poor (`P`), and recovering (`R`) people.")
         cols = st.columns(3)
         with cols[0]:
             beta = st.number_input("Beta (transition rate)", value=1e-6, format="%.6f")
             delta = st.number_input("Delta (to recovery rate)", value=0.1)
             gamma = st.number_input("Gamma (reversion rate)", value=0.05)
         with cols[1]:
-            M0 = st.number_input("Initial M (vulnerable)", value=70000.0)
-            P0 = st.number_input("Initial P (newly poor)", value=10000.0)
-            R0 = st.number_input("Initial R (recovered)", value=5000.0)
+            M0 = st.number_input("Initial M (vulnerable people)", value=70000, min_value=0, step=1)
+            P0 = st.number_input("Initial P (newly poor people)", value=10000, min_value=0, step=1)
+            R0 = st.number_input("Initial R (recovered people)", value=5000, min_value=0, step=1)
         with cols[2]:
             years = st.slider("Simulation years", 1, 50, 10)
             steps_per_year = st.selectbox("Steps per year", [1, 4, 12], index=0)
@@ -767,7 +793,7 @@ def build_modeling_section(baseline_frame: pd.DataFrame, projection_frame: pd.Da
             fig.add_trace(go.Scatter(x=df["t"], y=df["P"], mode="lines", name="Newly poor (P)"))
             fig.add_trace(go.Scatter(x=df["t"], y=df["R"], mode="lines", name="Recovered (R)"))
             fig.update_xaxes(title_text="Years")
-            fig.update_yaxes(title_text="Households")
+            fig.update_yaxes(title_text="People")
             st.plotly_chart(fig, use_container_width=True)
 
 
